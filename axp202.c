@@ -31,16 +31,60 @@ SPDX-License-Identifier: MIT
 
 */
 
-#include <stdint.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_freertos_hooks.h"
+#include "freertos/semphr.h"
+
+#include "esp_log.h"
 #include "axp202_config.h"
 #include "axp202.h"
+#include "stdbool.h"
 
-static axp202_err_t read_coloumb_counter(const axp202_t *axp, float *buffer);
-static axp202_err_t read_battery_power(const axp202_t *axp, float *buffer);
-static axp202_err_t read_fuel_gauge(const axp202_t *axp, float *buffer);
+#define AXP_DEBUG printf
+#define FORCED_OPEN_DCDC3(x) (x |= (AXP202_ON << AXP202_DCDC3))
+#define BIT_MASK(x) (1 << x)
+#define IS_OPEN(reg, channel) (bool)(reg & BIT_MASK(channel))
 
-static const axp202_init_command_t init_commands[] = {
+static axp202_err_t read_coloumb_counter( axp202_t *axp, float *buffer);
+static axp202_err_t read_battery_power( axp202_t *axp, float *buffer);
+static axp202_err_t read_fuel_gauge( axp202_t *axp, float *buffer);
+
+/* Some magic from some T-WATCH lib. */
+ uint8_t startupParams[] = {
+    0b00000000,
+    0b01000000,
+    0b10000000,
+    0b11000000
+};
+
+ uint8_t longPressParams[] = {
+    0b00000000,
+    0b00010000,
+    0b00100000,
+    0b00110000
+};
+
+ uint8_t shutdownParams[] = {
+    0b00000000,
+    0b00000001,
+    0b00000010,
+    0b00000011
+};
+
+ uint8_t targetVolParams[] = {
+    0b00000000,
+    0b00100000,
+    0b01000000,
+    0b01100000
+};
+
+static  axp202_init_command_t init_commands[] = {
     {AXP202_LDO24_VOLTAGE, {CONFIG_AXP202_LDO24_VOLTAGE}, 1},
     {AXP202_LDO3_VOLTAGE, {CONFIG_AXP202_LDO3_VOLTAGE}, 1},
     {AXP202_DCDC2_VOLTAGE, {CONFIG_AXP202_DCDC2_VOLTAGE}, 1},
@@ -53,30 +97,274 @@ static const axp202_init_command_t init_commands[] = {
     {0, {0}, 0xff},
 };
 
-axp202_err_t axp202_init(const axp202_t *axp)
-{
-    uint8_t cmd = 0;
-    axp202_err_t status;
-
-    /* Send all the commands. */
-    while (init_commands[cmd].count != 0xff) {
-        status = axp->write(
-            axp->handle,
-            AXP202_ADDRESS,
-            init_commands[cmd].command,
-            init_commands[cmd].data,
-            init_commands[cmd].count & 0x1f
-        );
-        if (AXP202_OK != status) {
-            return status;
-        }
-        cmd++;
+axp202_err_t axp202_init(axp202_t *axp) {
+    axp->read(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_IC_TYPE, &axp->chip_id, 1);
+    AXP_DEBUG("chip id detect 0x%x\n", axp->chip_id);
+    if (axp->chip_id == AXP202_CHIP_ID || axp->chip_id == AXP192_CHIP_ID) {
+        AXP_DEBUG("Detect CHIP :%s\n", axp->chip_id == AXP202_CHIP_ID ? "AXP202" : "AXP192");
+        axp->read(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_LDO234_DC23_CTL, &axp->outputReg, 1);
+        AXP_DEBUG("OUTPUT Register 0x%x\n", axp->outputReg);
+        axp->is_init = true;
+        return AXP202_OK;
     }
-
-    return AXP202_OK;
+    return AXP202_ERROR_NOTTY;    
 }
 
-axp202_err_t axp202_read(const axp202_t *axp, uint8_t reg, float *buffer)
+
+bool axp202_is_exten_enabled( axp202_t *axp)
+{
+    if (axp->chip_id == AXP202_CHIP_ID) {
+        return IS_OPEN(axp->outputReg, AXP202_EXTEN);
+    }
+
+    return false;
+}
+
+bool axp202_is_ldo2_enabled( axp202_t *axp)
+{
+    //axp192 same axp202 ldo2 bit
+    return IS_OPEN(axp->outputReg, AXP202_LDO2);
+}
+
+
+bool axp202_is_ldo3_enabled( axp202_t *axp)
+{
+    if (axp->chip_id == AXP202_CHIP_ID) {
+        return IS_OPEN(axp->outputReg, AXP202_LDO3);
+    }
+    return false;
+}
+
+bool axp202_is_ldo4_enabled( axp202_t *axp)
+{
+    if (axp->chip_id == AXP202_CHIP_ID)
+        return IS_OPEN(axp->outputReg, AXP202_LDO4);
+    return false;
+}
+
+
+bool axp202_is_dcdc2_enabled( axp202_t *axp)
+{
+    //axp192 same axp202 dc2 bit
+    return IS_OPEN(axp->outputReg, AXP202_DCDC2);
+}
+
+bool axp202_is_dcdc3_enabled( axp202_t *axp)
+{
+    if (axp->chip_id == AXP173_CHIP_ID)
+        return false;
+    //axp192 same axp202 dc3 bit
+    return IS_OPEN(axp->outputReg, AXP202_DCDC3);
+}
+
+
+axp202_err_t axp202_set_power_output( axp202_t *axp, uint8_t ch, bool en)
+{
+    uint8_t data = 0;
+    uint8_t val = 0;
+    if (!axp->is_init) {
+        return AXP_NOT_INIT;
+    }
+    
+    axp->read(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_LDO234_DC23_CTL, &data, 1);
+    if (en) {
+        data |= (1 << ch);
+    } else {
+        data &= (~(1 << ch));
+    }
+
+    if (axp->chip_id == AXP202_CHIP_ID) {
+        FORCED_OPEN_DCDC3(data); //! Must be forced open in T-Watch
+    }
+
+    axp->write(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_LDO234_DC23_CTL, &data, 1);
+    vTaskDelay(pdMS_TO_TICKS(1));
+    axp->read(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_LDO234_DC23_CTL, &val, 1);
+    if (data == val) {
+        axp->outputReg = val;
+        return AXP_PASS;
+    }
+    return AXP_FAIL;
+}
+
+bool axp202_is_charging( axp202_t *axp)
+{
+    uint8_t reg;
+    if (!axp->is_init) {
+        return AXP_NOT_INIT;
+    }
+
+    axp->read(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_MODE_CHGSTATUS, &reg, 1);
+    return IS_OPEN(reg, 6);
+}
+
+axp202_err_t axp202_set_irq(axp202_t *axp, uint32_t irq, bool enable) 
+{
+    if (!axp->is_init)
+        return AXP_NOT_INIT;
+    uint8_t val, val1;
+    if (irq & 0xFF) {
+        val1 = irq & 0xFF;
+        axp->read(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_INTEN1, &val, 1);
+        if (enable)
+            val |= val1;
+        else
+            val &= ~(val1);
+        AXP_DEBUG("%s [0x%x]val:0x%x\n", enable ? "enable" : "disable", AXP202_INTEN1, val);
+        axp->write(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_INTEN1, &val, 1);
+    }
+    if (irq & 0xFF00) {
+        val1 = irq >> 8;
+        axp->read(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_INTEN2, &val, 1);
+        if (enable)
+            val |= val1;
+        else
+            val &= ~(val1);
+        AXP_DEBUG("%s [0x%x]val:0x%x\n", enable ? "enable" : "disable", AXP202_INTEN2, val);
+        axp->write(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_INTEN2, &val, 1);
+    }
+
+    if (irq & 0xFF0000) {
+        val1 = irq >> 16;
+        axp->read(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_INTEN3, &val, 1);
+        if (enable)
+            val |= val1;
+        else
+            val &= ~(val1);
+        AXP_DEBUG("%s [0x%x]val:0x%x\n", enable ? "enable" : "disable", AXP202_INTEN3, val);
+        axp->write(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_INTEN3, &val, 1);
+    }
+
+    if (irq & 0xFF000000) {
+        val1 = irq >> 24;
+        axp->read(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_INTEN4, &val, 1);
+        if (enable)
+            val |= val1;
+        else
+            val &= ~(val1);
+        AXP_DEBUG("%s [0x%x]val:0x%x\n", enable ? "enable" : "disable", AXP202_INTEN4, val);
+        axp->write(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_INTEN4,&val, 1);
+    }
+
+    if (irq & 0xFF00000000) {
+        val1 = irq >> 32;
+        axp->read(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_INTEN5, &val, 1);
+        if (enable)
+            val |= val1;
+        else
+            val &= ~(val1);
+        AXP_DEBUG("%s [0x%x]val:0x%x\n", enable ? "enable" : "disable", AXP202_INTEN5, val);
+        axp->write(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_INTEN5, &val, 1);
+    }
+    return AXP_PASS;
+}
+
+void clear_irq(axp202_t *axp)
+{
+    uint8_t val = 0xFF;
+    switch (axp->chip_id) {
+    case AXP192_CHIP_ID:
+        for (int i = 0; i < 3; i++) {
+            axp->write(axp->handle, AXP202_SLAVE_ADDRESS, AXP192_INTSTS1 + i, &val, 1);
+        }
+        axp->write(axp->handle, AXP202_SLAVE_ADDRESS, AXP192_INTSTS5, &val, 1);
+        break;
+    case AXP202_CHIP_ID:
+        for (int i = 0; i < 5; i++) {
+            axp->write(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_INTSTS1 + i, &val, 1);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+axp202_err_t axp202_adc1_control(axp202_t *axp, uint16_t params, bool en)
+{
+    if (!axp->is_init)
+        return AXP_NOT_INIT;
+    uint8_t val;
+    axp->read(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_ADC_EN1, &val, 1);
+    if (en)
+        val |= params;
+    else
+        val &= ~(params);
+    axp->write(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_ADC_EN1, &val, 1);
+    return AXP_PASS;
+}
+
+bool axp202_is_battery_connected(axp202_t *axp)
+{
+    uint8_t reg;
+    if (!axp->is_init) {
+        return AXP_NOT_INIT;
+    }
+    axp->read(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_MODE_CHGSTATUS, &reg, 1);
+    return IS_OPEN(reg, 5);
+}
+
+axp202_err_t axp202_set_charging_voltage(axp202_t *axp, axp_chargeing_vol_t param)
+{
+    uint8_t val;
+    if (!axp->is_init) {
+        return AXP_NOT_INIT;
+    }
+    if (param > sizeof(targetVolParams) / sizeof(targetVolParams[0])) {
+        return AXP_INVALID;
+    }
+    axp->read(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_CHARGE1, &val, 1);
+    val &= ~(0b01100000);
+    val |= targetVolParams[param];
+    axp->read(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_CHARGE1, &val, 1);
+    return AXP_PASS;
+}
+
+axp202_err_t axp202_enable_charging(axp202_t *axp, bool en)
+{
+    uint8_t val;
+    if (!axp->is_init)
+        return AXP_NOT_INIT;
+    axp->read(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_CHARGE1, &val, 1);
+    if (en) {
+        val |= (1 << 7);
+    } else {
+        val &= ~(1 << 7);
+    }
+    axp->write(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_CHARGE1, &val, 1);
+    return AXP_PASS;
+}
+
+axp202_err_t axp202_set_charge_current(axp202_t *axp, uint16_t mA)
+{
+    uint8_t val;
+    if (!axp->is_init) {
+        return AXP_NOT_INIT;
+    }
+    switch (axp->chip_id) {
+        case AXP202_CHIP_ID:
+            axp->read(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_CHARGE1, &val, 1);
+            val &= 0b11110000;
+            mA -= 300;
+            val |= (mA / 100);
+            axp->write(axp->handle, AXP202_SLAVE_ADDRESS,AXP202_CHARGE1, &val, 1);
+            return AXP_PASS;
+        case AXP192_CHIP_ID:
+        case AXP173_CHIP_ID:
+            axp->read(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_CHARGE1, &val, 1);
+            val &= 0b11110000;
+            if(mA > AXP1XX_CHARGE_CUR_1320MA)
+                mA = AXP1XX_CHARGE_CUR_1320MA;
+            val |= mA;
+            axp->write(axp->handle, AXP202_SLAVE_ADDRESS, AXP202_CHARGE1, &val, 1);
+            return AXP_PASS;
+        default:
+        break;
+    }
+
+    return AXP_NOT_SUPPORT;
+}
+
+axp202_err_t axp202_read( axp202_t *axp, uint8_t reg, float *buffer)
 {
     uint8_t tmp[4];
     float sensitivity = 1.0;
@@ -150,7 +438,7 @@ axp202_err_t axp202_read(const axp202_t *axp, uint8_t reg, float *buffer)
     return AXP202_OK;
 }
 
-axp202_err_t axp202_ioctl(const axp202_t *axp, uint16_t command, uint8_t *buffer)
+axp202_err_t axp202_ioctl( axp202_t *axp, uint16_t command, uint8_t *buffer)
 {
     uint8_t reg = command >> 8;
     uint8_t tmp;
@@ -181,7 +469,7 @@ axp202_err_t axp202_ioctl(const axp202_t *axp, uint16_t command, uint8_t *buffer
     return AXP202_ERROR_NOTTY;
 }
 
-static axp202_err_t read_coloumb_counter(const axp202_t *axp, float *buffer)
+static axp202_err_t read_coloumb_counter( axp202_t *axp, float *buffer)
 {
     uint8_t tmp[4];
     int32_t coin, coout;
@@ -205,7 +493,7 @@ static axp202_err_t read_coloumb_counter(const axp202_t *axp, float *buffer)
     return AXP202_OK;
 }
 
-static axp202_err_t read_battery_power(const axp202_t *axp, float *buffer)
+static axp202_err_t read_battery_power( axp202_t *axp, float *buffer)
 {
     uint8_t tmp[4];
     float sensitivity;
@@ -221,7 +509,7 @@ static axp202_err_t read_battery_power(const axp202_t *axp, float *buffer)
     return AXP202_OK;
 }
 
-static axp202_err_t read_fuel_gauge(const axp202_t *axp, float *buffer)
+static axp202_err_t read_fuel_gauge( axp202_t *axp, float *buffer)
 {
     axp202_err_t status;
     uint8_t tmp;
